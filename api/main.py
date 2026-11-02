@@ -65,8 +65,12 @@ def _input_hash(window: List[float]) -> str:
 
 def _artifact_or_404(run_id: int) -> str:
     b64 = db.get_run_artifact(run_id)
+
     if b64 is None:
+        print(f"ARTIFACT NOT FOUND: run_id={run_id}")
         raise HTTPException(status_code=404, detail="run_id not found")
+
+    print(f"ARTIFACT FOUND: run_id={run_id}, size={len(b64)}")
     return b64
 
 
