@@ -1,78 +1,86 @@
--- 001_init.sql
--- Tables for the "Attend-It" product: LSTM + attention sequence classifier.
--- Apply this in the Supabase dashboard: SQL Editor -> New query -> paste -> Run.
+-- 001_init.sql  --  Variant A: 24-hour temperature forecasting (LSTM vs. attention)
+-- Apply in the Supabase dashboard: SQL Editor -> New query -> paste -> Run.
 
 -- ---------------------------------------------------------------------------
--- datasets: one row per synthetic sequence dataset. Only the generation
--- PARAMETERS are stored -- the token sequences are regenerated deterministically
--- from `seed`, so no raw sequences live in the database.
+-- sequences: the training corpus (Jena Climate, one temperature per hour).
+-- `split` is assigned chronologically by db/load.py (70% train / 15% val / 15% test).
 -- ---------------------------------------------------------------------------
-create table if not exists datasets (
-    id          bigint generated always as identity primary key,
-    name        text        not null,
-    n_rows      integer     not null,
-    seq_len     integer     not null,
-    vocab_size  integer     not null,
-    n_classes   integer     not null,
-    seed        integer     not null,
-    created_at  timestamptz not null default now()
+create table if not exists sequences (
+    id        bigint generated always as identity primary key,
+    ts        timestamptz      not null,
+    value     double precision not null,      -- temperature, degrees C
+    split     text             not null check (split in ('train', 'val', 'test'))
 );
+create index if not exists idx_sequences_split_ts on sequences (split, ts);
 
 -- ---------------------------------------------------------------------------
--- runs: one row per training job (held-out metrics). Anon-readable.
+-- runs: one row per trained model (lstm vs. attention) with its headline metric.
+-- `examples` holds the illustrative and "confidently wrong" test windows so the UI
+-- can show them without re-running anything.
 -- ---------------------------------------------------------------------------
 create table if not exists runs (
-    id          bigint generated always as identity primary key,
-    dataset_id  bigint      not null references datasets (id) on delete cascade,
-    lr          double precision not null,
-    batch_size  integer     not null,
-    epochs      integer     not null,
-    accuracy    double precision not null,
-    macro_f1    double precision not null,
-    created_at  timestamptz not null default now()
+    id               bigint generated always as identity primary key,
+    model_type       text   not null check (model_type in ('lstm', 'attention')),
+    hyperparameters  jsonb  not null,
+    test_mae         double precision not null,   -- headline metric, degrees C
+    test_mse         double precision not null,
+    val_mae          double precision not null,
+    persistence_mae  double precision not null,   -- "tomorrow = right now" reference
+    resid_q90        double precision not null,   -- 90% error band half-width, degrees C
+    n_params         integer not null,
+    train_seconds    double precision not null,
+    examples         jsonb,
+    created_at       timestamptz not null default now()
 );
+create index if not exists idx_runs_created_at on runs (created_at desc);
 
--- ---------------------------------------------------------------------------
--- run_artifacts: the fitted attention model, base64-encoded. Not anon-readable.
--- ---------------------------------------------------------------------------
+-- The fitted model + scaler, base64. Not anon-readable.
 create table if not exists run_artifacts (
-    run_id      bigint      primary key references runs (id) on delete cascade,
-    model_b64   text        not null,
-    created_at  timestamptz not null default now()
+    run_id     bigint primary key references runs (id) on delete cascade,
+    model_b64  text not null,
+    created_at timestamptz not null default now()
 );
 
 -- ---------------------------------------------------------------------------
--- sequence_metadata: one row per served prediction. We store the sequence's
--- SHA-256 hash + length + predicted class -- NEVER the raw tokens (privacy
--- invariant).
+-- predictions: one row per served prediction (audit trail for the weekly review).
+-- Only a SHA-256 of the input window is stored, never the raw readings.
 -- ---------------------------------------------------------------------------
-create table if not exists sequence_metadata (
-    id          bigint generated always as identity primary key,
-    run_id      bigint      not null references runs (id) on delete cascade,
-    sha256      text        not null,
-    length      integer     not null,
-    label       integer     not null,
-    class_name  text        not null,
-    confidence  double precision not null,
-    created_at  timestamptz not null default now()
+create table if not exists predictions (
+    id                    bigint generated always as identity primary key,
+    input_hash            text   not null,
+    predicted_value       double precision not null,   -- degrees C, 24 h ahead
+    attention_vector_json jsonb,                       -- last attention row (48 weights); null for lstm
+    served_by_run_id      bigint not null references runs (id) on delete cascade,
+    created_at            timestamptz not null default now()
 );
-
-create index if not exists idx_runs_dataset_id          on runs (dataset_id);
-create index if not exists idx_runs_created_at           on runs (created_at desc);
-create index if not exists idx_sequence_metadata_run_id  on sequence_metadata (run_id);
+create index if not exists idx_predictions_created_at on predictions (created_at desc);
+create index if not exists idx_predictions_run_id     on predictions (served_by_run_id);
 
 -- ---------------------------------------------------------------------------
--- Row Level Security. The Streamlit "Run History" tab reads `runs` with the
--- ANON key, so we allow anonymous SELECT on runs only. The API uses the
--- SERVICE-ROLE key which bypasses RLS, so all writes stay server-side.
+-- model_comparison: the README table is generated from this view (db/readme_table.py).
+-- Latest run of each model type.
 -- ---------------------------------------------------------------------------
-alter table datasets          enable row level security;
-alter table runs              enable row level security;
-alter table run_artifacts     enable row level security;
-alter table sequence_metadata enable row level security;
+create or replace view model_comparison as
+select distinct on (model_type)
+    model_type, id as run_id, test_mae, test_mse, val_mae, persistence_mae,
+    n_params, train_seconds, created_at
+from runs
+order by model_type, created_at desc;
 
-drop policy if exists "anon can read runs" on runs;
-create policy "anon can read runs"
-    on runs for select
-    to anon
-    using (true);
+-- ---------------------------------------------------------------------------
+-- Row Level Security. The Streamlit UI uses the ANON key and may only SELECT
+-- sequences, runs, predictions and the view. Writes use the service-role key.
+-- ---------------------------------------------------------------------------
+alter table sequences     enable row level security;
+alter table runs          enable row level security;
+alter table run_artifacts enable row level security;
+alter table predictions   enable row level security;
+
+drop policy if exists "anon can read sequences"   on sequences;
+drop policy if exists "anon can read runs"        on runs;
+drop policy if exists "anon can read predictions" on predictions;
+create policy "anon can read sequences"   on sequences   for select to anon using (true);
+create policy "anon can read runs"        on runs        for select to anon using (true);
+create policy "anon can read predictions" on predictions for select to anon using (true);
+
+grant select on model_comparison to anon;

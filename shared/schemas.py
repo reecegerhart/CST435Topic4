@@ -1,125 +1,119 @@
-"""Pydantic request/response models shared by the API and (optionally) the UI.
+"""Pydantic request/response models: the contract between the three clouds.
 
-The contract between the three clouds. "Attend-It" is sequence classification
-with an LSTM + additive (Bahdanau) attention; the per-timestep attention weights
-are returned so a client can see *which token* the model relied on. The *shape*
-of the contract is identical to the base template; only the fields change.
+Input validation lives here. A window must be EXACTLY 48 hourly readings, each a
+real JSON number (strings and booleans are rejected, not silently coerced), finite,
+and inside a physically plausible range for air temperature.
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictFloat, StrictInt, field_validator
 
+from shared.data import HORIZON, MAX_TEMP_C, MIN_TEMP_C, WINDOW
 
-# ---------------------------------------------------------------------------
-# Datasets
-# ---------------------------------------------------------------------------
-class DatasetCreate(BaseModel):
-    """Request body for POST /datasets."""
-
-    name: str = Field(..., min_length=1, max_length=100)
-    n_rows: int = Field(800, ge=100, le=20_000)
-    seq_len: int = Field(12, ge=4, le=64, description="Tokens per sequence.")
-    seed: int = Field(42, description="Seed for the synthetic sequence generator.")
+Number = Union[StrictInt, StrictFloat]
+ModelType = Literal["lstm", "attention"]
+MAX_BATCH = 50
 
 
-class Dataset(BaseModel):
-    """A dataset row as stored in Supabase."""
-
-    id: int
-    name: str
-    n_rows: int
-    seq_len: int
-    vocab_size: int
-    n_classes: int
-    created_at: datetime
+def _check_window(w: List[Number]) -> List[Number]:
+    for v in w:
+        if not math.isfinite(v):
+            raise ValueError("window values must be finite numbers")
+        if not (MIN_TEMP_C <= v <= MAX_TEMP_C):
+            raise ValueError(f"temperatures must be between {MIN_TEMP_C} and {MAX_TEMP_C} degC")
+    return w
 
 
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
-class TrainRequest(BaseModel):
-    """Request body for POST /train."""
-
-    dataset_id: int
-    lr: float = Field(0.01, gt=0.0, description="Adam learning rate.")
-    batch_size: int = Field(32, ge=1)
-    epochs: int = Field(12, ge=1, le=500)
-    test_size: float = Field(0.2, gt=0.0, lt=1.0, description="Held-out fraction.")
-
-
-class ClassMetrics(BaseModel):
-    accuracy: float
-    macro_f1: float
-
-
-class Run(BaseModel):
-    """A training-run row as stored in Supabase (metrics only)."""
-
-    id: int
-    dataset_id: int
-    lr: float
-    batch_size: int
-    epochs: int
-    accuracy: float
-    macro_f1: float
-    created_at: datetime
-
-
-class TrainResponse(BaseModel):
-    run_id: int
-    metrics: ClassMetrics
-
-
-# ---------------------------------------------------------------------------
-# Prediction  (attention explainability)
-# ---------------------------------------------------------------------------
 class PredictRequest(BaseModel):
-    """Request body for POST /predict."""
+    run_id: int = Field(..., ge=1)
+    window: List[Number] = Field(
+        ..., min_length=WINDOW, max_length=WINDOW,
+        description=f"The last {WINDOW} hourly temperatures in degC, oldest first.",
+    )
 
-    run_id: int
-    sequence: List[int] = Field(..., min_length=2, description="Token ids to classify.")
+    @field_validator("window")
+    @classmethod
+    def _window_ok(cls, w):
+        return _check_window(w)
+
+
+class PredictBatchRequest(BaseModel):
+    run_id: int = Field(..., ge=1)
+    windows: List[List[Number]] = Field(..., min_length=1, max_length=MAX_BATCH)
+
+    @field_validator("windows")
+    @classmethod
+    def _each(cls, ws):
+        for w in ws:
+            if len(w) != WINDOW:
+                raise ValueError(f"every window must have exactly {WINDOW} values")
+            _check_window(w)
+        return ws
 
 
 class PredictResponse(BaseModel):
     run_id: int
-    label: int
-    class_name: str
-    confidence: float = Field(..., description="Softmax probability of the top class.")
-    probs: List[float]
-    sequence: List[int] = Field(..., description="The tokens the model scored.")
-    attention: List[float] = Field(
-        ..., description="Per-timestep attention weights (sum to 1)."
+    model_type: ModelType
+    horizon_hours: int = HORIZON
+    prediction: float = Field(..., description="Forecast temperature in degC, 24 h after the last input hour.")
+    interval_low: float
+    interval_high: float
+    interval_note: str = "About 90% of validation-set forecasts fell inside this band."
+    input_hash: str = Field(..., description="SHA-256 of the input window; raw values are not stored.")
+    attention_matrix: Optional[List[List[float]]] = Field(
+        None, description="[48 x 48] self-attention weights (rows sum to 1); null for the LSTM."
     )
-    sequence_sha256: str = Field(..., description="Hash of the input sequence (no raw tokens stored).")
-    true_class: Optional[str] = Field(
-        None, description="Ground-truth class when predicting a generated sample."
-    )
-
-
-class PredictSampleRequest(BaseModel):
-    """Request body for POST /predict_sample (no sequence needed)."""
-
-    run_id: int
-    seed: int = Field(0, description="Seed for the generated sample.")
-    true_class: Optional[int] = Field(
-        None, ge=0, description="Force a class index; None picks one at random."
+    attention_last_row: Optional[List[float]] = Field(
+        None, description="Which past hours the final position attended to (48 weights)."
     )
 
 
-# ---------------------------------------------------------------------------
-# Meta
-# ---------------------------------------------------------------------------
-class ClassesResponse(BaseModel):
-    classes: List[str]
-    n_classes: int
+class PredictBatchResponse(BaseModel):
+    results: List[PredictResponse]
 
 
-# ---------------------------------------------------------------------------
-# Ops
-# ---------------------------------------------------------------------------
+class TrainRequest(BaseModel):
+    model_type: ModelType
+    lr: float = Field(0.003, gt=0.0, le=1.0)
+    batch_size: int = Field(64, ge=8, le=1024)
+    epochs: int = Field(12, ge=1, le=100)
+    hidden_dim: int = Field(32, ge=8, le=128)
+    max_train_rows: Optional[int] = Field(
+        None, ge=500, description="Cap rows read per split (keeps the Render free tier fast)."
+    )
+
+
+class Run(BaseModel):
+    id: int
+    model_type: ModelType
+    hyperparameters: Dict[str, Any]
+    test_mae: float
+    test_mse: float
+    val_mae: float
+    persistence_mae: float
+    resid_q90: float
+    n_params: int
+    train_seconds: float
+    created_at: datetime
+
+
+class TrainResponse(BaseModel):
+    run: Run
+
+
+class StoredPrediction(BaseModel):
+    id: int
+    input_hash: str
+    predicted_value: float
+    attention_vector_json: Optional[List[float]] = None
+    served_by_run_id: int
+    created_at: datetime
+
+
 class Health(BaseModel):
     status: str
     model_loader: bool

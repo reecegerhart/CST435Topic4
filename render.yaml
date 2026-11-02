@@ -4,7 +4,7 @@
 # in the service settings after the first deploy.
 services:
   - type: web
-    name: attend-it-api
+    name: forecast-it-api
     runtime: python
     plan: free
     buildCommand: "pip install -r api/requirements.txt"

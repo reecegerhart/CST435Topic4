@@ -1,159 +1,206 @@
-"""LSTM + additive (Bahdanau) attention for sequence classification.
+"""Training, evaluation and inference for the two forecasters.
 
-This is the ONLY place model code lives. It is pulled in by the FastAPI service
-on Render.com; it is never imported by Streamlit. It trains a compact recurrent
-network on the synthetic trigger-token dataset and, at predict time, returns the
-**per-timestep attention weights** so a non-technical client can see *which
-token* the network relied on.
+This is the ONLY place model code is used by the service. Both architectures go
+through the SAME function with the SAME preprocessing, optimizer, loss, epoch
+budget and seed, so the comparison in the README is like-for-like:
 
-The fitted model is pickled + base64-encoded so it can be persisted to Supabase
-and reloaded per request (survives Render free-tier restarts).
+    standardize (train-split mean/std) -> 48 h windows -> Adam + MSE -> keep the
+    epoch with the best validation loss -> report test MAE in degrees C.
+
+The fitted model, its scaler and a calibrated error band are packed into one
+base64 string so they can be stored in Supabase (`run_artifacts`) and reloaded on
+every request -- the Render free tier restarts often and has no persistent disk.
 """
 from __future__ import annotations
 
 import base64
-import pickle
-from typing import Dict, List, Tuple
+import io
+import time
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
 from torch import nn
 
-from shared.data import CLASS_NAMES, N_CLASSES, VOCAB_SIZE, generate_sequences
+from api.models import build_model
+from shared.data import HORIZON, WINDOW, Scaler, make_windows
 
-EMBED_DIM = 16
-HIDDEN_DIM = 32
-
-
-class AttnClassifier(nn.Module):
-    """Embedding -> LSTM -> additive attention -> linear classifier.
-
-    The attention layer scores each hidden state ``h_t`` with
-    ``score_t = vᵀ tanh(W h_t)``, softmaxes the scores into weights that sum to
-    1, and forms a context vector ``c = Σ_t weight_t · h_t``. Returning those
-    weights is what makes the model interpretable.
-    """
-
-    def __init__(self, vocab_size: int, n_classes: int,
-                 embed_dim: int = EMBED_DIM, hidden_dim: int = HIDDEN_DIM):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
-        self.attn_w = nn.Linear(hidden_dim, hidden_dim)
-        self.attn_v = nn.Linear(hidden_dim, 1, bias=False)
-        self.classifier = nn.Linear(hidden_dim, n_classes)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(logits [B, C], attention [B, T])``."""
-        emb = self.embedding(x)                       # [B, T, E]
-        hidden, _ = self.lstm(emb)                    # [B, T, H]
-        scores = self.attn_v(torch.tanh(self.attn_w(hidden))).squeeze(-1)  # [B, T]
-        weights = torch.softmax(scores, dim=1)        # [B, T]
-        context = torch.bmm(weights.unsqueeze(1), hidden).squeeze(1)       # [B, H]
-        logits = self.classifier(context)             # [B, C]
-        return logits, weights
+DEFAULT_HP = {"lr": 0.003, "batch_size": 64, "epochs": 12, "hidden_dim": 32, "seed": 0}
 
 
-def _split(n: int, test_size: float, seed: int = 0) -> Tuple[np.ndarray, np.ndarray]:
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(n)
-    n_test = int(n * test_size)
-    return idx[n_test:], idx[:n_test]
+def _to_tensor(a: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32))
 
 
-def _macro_f1(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) -> float:
-    f1s = []
-    for c in range(n_classes):
-        tp = int(((y_pred == c) & (y_true == c)).sum())
-        fp = int(((y_pred == c) & (y_true != c)).sum())
-        fn = int(((y_pred != c) & (y_true == c)).sum())
-        p = tp / (tp + fp) if tp + fp else 0.0
-        r = tp / (tp + fn) if tp + fn else 0.0
-        f1s.append(2 * p * r / (p + r) if p + r else 0.0)
-    return float(np.mean(f1s))
-
-
-def train_attention(
-    n_rows: int,
-    seq_len: int,
-    seed: int,
-    lr: float,
-    batch_size: int,
-    epochs: int,
-    test_size: float = 0.2,
-) -> Tuple[Dict[str, float], str, List[float]]:
-    """Regenerate the dataset from its seed, train, return metrics + artifact.
-
-    Returns ``(metrics, model_b64, loss_history)``.
-    """
-    sequences, labels, _pos = generate_sequences(n_rows, seq_len=seq_len, seed=seed)
-    y = np.asarray(labels, dtype=np.int64)
-
-    train_idx, test_idx = _split(len(sequences), test_size)
-    x_train = torch.from_numpy(sequences[train_idx])
-    x_test = torch.from_numpy(sequences[test_idx])
-    y_train = torch.from_numpy(y[train_idx])
-    y_test = y[test_idx]
-
-    torch.manual_seed(0)
-    model = AttnClassifier(VOCAB_SIZE, N_CLASSES)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.CrossEntropyLoss()
-
-    n = x_train.shape[0]
-    loss_history: List[float] = []
-    for _ in range(epochs):
-        perm = torch.randperm(n)
-        epoch_loss = 0.0
-        for start in range(0, n, batch_size):
-            b = perm[start : start + batch_size]
-            xb, yb = x_train[b], y_train[b]
-            optimizer.zero_grad()
-            logits, _ = model(xb)
-            loss = loss_fn(logits, yb)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * xb.shape[0]
-        loss_history.append(epoch_loss / n)
-
+def _predict_scaled(model: nn.Module, x: torch.Tensor, batch: int = 1024):
+    """Run the model in batches; return (preds [N], last attention rows [N,T] | None)."""
     model.eval()
+    preds, rows = [], []
     with torch.no_grad():
-        logits, _ = model(x_test)
-        preds = logits.argmax(dim=1).numpy()
+        for s in range(0, len(x), batch):
+            p, w = model(x[s : s + batch])
+            preds.append(p)
+            if w is not None:
+                rows.append(w[:, -1, :])
+    return torch.cat(preds).numpy(), (torch.cat(rows).numpy() if rows else None)
+
+
+def _entropy(rows: np.ndarray) -> np.ndarray:
+    return -(rows * np.log(rows + 1e-12)).sum(axis=1)
+
+
+def train_model(
+    train: np.ndarray,
+    val: np.ndarray,
+    test: np.ndarray,
+    model_type: str,
+    lr: float = DEFAULT_HP["lr"],
+    batch_size: int = DEFAULT_HP["batch_size"],
+    epochs: int = DEFAULT_HP["epochs"],
+    hidden_dim: int = DEFAULT_HP["hidden_dim"],
+    seed: int = DEFAULT_HP["seed"],
+) -> Dict[str, object]:
+    """Fit one model on hourly-temperature splits (1-D arrays, in time order)."""
+    started = time.time()
+    scaler = Scaler.fit(train)
+    xs, ys = {}, {}
+    for name, series in (("train", train), ("val", val), ("test", test)):
+        x, y = make_windows(series)
+        xs[name], ys[name] = x, y            # raw degC, kept for metrics/examples
+    x_train, y_train = _to_tensor(scaler.transform(xs["train"])), _to_tensor(scaler.transform(ys["train"]))
+    x_val, y_val = _to_tensor(scaler.transform(xs["val"])), ys["val"]
+    x_test = _to_tensor(scaler.transform(xs["test"]))
+
+    torch.manual_seed(seed)
+    model = build_model(model_type, hidden_dim=hidden_dim, window=WINDOW)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+
+    g = torch.Generator().manual_seed(seed)
+    n = len(x_train)
+    best_val, best_state, loss_history = float("inf"), None, []
+    for _ in range(epochs):
+        model.train()
+        perm = torch.randperm(n, generator=g)
+        total = 0.0
+        for s in range(0, n, batch_size):
+            b = perm[s : s + batch_size]
+            optimizer.zero_grad()
+            pred, _ = model(x_train[b])
+            loss = loss_fn(pred, y_train[b])
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total += loss.item() * len(b)
+        loss_history.append(total / n)
+        v_pred, _ = _predict_scaled(model, x_val)
+        v_mae = float(np.abs(scaler.inverse(v_pred) - y_val).mean())
+        if v_mae < best_val:
+            best_val = v_mae
+            best_state = {k: t.clone() for k, t in model.state_dict().items()}
+    model.load_state_dict(best_state)
+
+    # ---- evaluation (degrees C) -------------------------------------------------
+    v_pred = scaler.inverse(_predict_scaled(model, x_val)[0])
+    resid_q90 = float(np.quantile(np.abs(v_pred - y_val), 0.90))   # calibrated on VAL
+    t_scaled, t_rows = _predict_scaled(model, x_test)
+    t_pred, t_true = scaler.inverse(t_scaled), ys["test"]
+    err = t_pred - t_true
     metrics = {
-        "accuracy": float((preds == y_test).mean()),
-        "macro_f1": _macro_f1(y_test, preds, N_CLASSES),
+        "test_mae": float(np.abs(err).mean()),
+        "test_mse": float((err ** 2).mean()),
+        "val_mae": float(best_val),
+        "persistence_mae": float(np.abs(xs["test"][:, -1] - t_true).mean()),
+        "resid_q90": resid_q90,
+        "n_params": int(sum(p.numel() for p in model.parameters())),
+        "train_seconds": float(time.time() - started),
+        "n_train_windows": int(n),
     }
 
-    artifact = {
-        "state_dict": model.state_dict(),
-        "vocab_size": VOCAB_SIZE,
-        "n_classes": N_CLASSES,
+    examples = _build_examples(xs["test"], t_true, t_pred, t_rows, err)
+
+    buf = io.BytesIO()
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "model_type": model_type,
+            "hidden_dim": hidden_dim,
+            "window": WINDOW,
+            "horizon": HORIZON,
+            "scaler": scaler.to_dict(),
+            "resid_q90": resid_q90,
+        },
+        buf,
+    )
+    return {
+        "metrics": metrics,
+        "model_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
+        "loss_history": loss_history,
+        "examples": examples,
+        "test_predictions": t_pred,   # same test windows for both models (used by the CLI)
     }
-    model_b64 = base64.b64encode(pickle.dumps(artifact)).decode("ascii")
-    return metrics, model_b64, loss_history
 
 
-def _load_model(model_b64: str) -> AttnClassifier:
-    obj = pickle.loads(base64.b64decode(model_b64))
-    model = AttnClassifier(obj["vocab_size"], obj["n_classes"])
+def _build_examples(x_raw, y_true, y_pred, rows: Optional[np.ndarray], err) -> Dict[str, list]:
+    """Three illustrative test windows, plus (attention model only) three failures.
+
+    'Confidently wrong' for a regressor = large error while the last attention row is
+    sharply peaked (entropy in the lowest 20% of the test set).
+    """
+
+    def item(i: int) -> dict:
+        d = {
+            "test_index": int(i),
+            "window": [round(float(v), 2) for v in x_raw[i]],
+            "target": round(float(y_true[i]), 2),
+            "prediction": round(float(y_pred[i]), 2),
+            "abs_error": round(float(abs(err[i])), 2),
+        }
+        if rows is not None:
+            d["attention"] = [round(float(v), 5) for v in rows[i]]
+            d["attention_peak_hours_ago"] = int(WINDOW - 1 - np.argmax(rows[i]))
+        return d
+
+    n = len(y_true)
+    out: Dict[str, list] = {"illustrative": [item(int(n * f)) for f in (0.10, 0.50, 0.90)]}
+    if rows is not None:
+        ent = _entropy(rows)
+        sharp = np.where(ent <= np.quantile(ent, 0.20))[0]
+        worst = sharp[np.argsort(-np.abs(err[sharp]))[:3]]
+        out["failures"] = [dict(item(int(i)), attention_entropy=round(float(ent[i]), 3)) for i in worst]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# inference
+# ---------------------------------------------------------------------------
+def load_artifact(model_b64: str):
+    obj = torch.load(io.BytesIO(base64.b64decode(model_b64)), map_location="cpu", weights_only=True)
+    model = build_model(obj["model_type"], hidden_dim=obj["hidden_dim"], window=obj["window"])
     model.load_state_dict(obj["state_dict"])
     model.eval()
-    return model
+    return model, Scaler.from_dict(obj["scaler"]), obj
 
 
-def predict_seq(model_b64: str, sequence: List[int]) -> Dict[str, object]:
-    """Classify one token sequence and return per-timestep attention weights."""
-    model = _load_model(model_b64)
-    x = torch.tensor([sequence], dtype=torch.long)   # [1, T]
+def predict_windows(model_b64: str, windows: List[List[float]]) -> List[Dict[str, object]]:
+    """Forecast each 48-hour window; attention (if the model has any) comes back too."""
+    model, scaler, meta = load_artifact(model_b64)
+    x = _to_tensor(scaler.transform(np.asarray(windows, dtype=np.float32)))
     with torch.no_grad():
-        logits, weights = model(x)
-        probs_t = torch.softmax(logits, dim=1)[0]
-    label = int(probs_t.argmax().item())
-    return {
-        "label": label,
-        "class_name": CLASS_NAMES[label],
-        "confidence": float(probs_t[label].item()),
-        "probs": [float(p) for p in probs_t.tolist()],
-        "attention": [float(w) for w in weights[0].tolist()],
-    }
+        pred, weights = model(x)
+    values = scaler.inverse(pred.numpy())
+    q = float(meta["resid_q90"])
+    results = []
+    for i, v in enumerate(values):
+        w = weights[i].tolist() if weights is not None else None
+        results.append(
+            {
+                "model_type": meta["model_type"],
+                "prediction": float(v),
+                "interval_low": float(v) - q,
+                "interval_high": float(v) + q,
+                "attention_matrix": w,                                  # [T, T] or None
+                "attention_last_row": w[-1] if w is not None else None,  # [T] or None
+            }
+        )
+    return results
